@@ -1,0 +1,16 @@
+[project]
+name = "pp-voice-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "sherpa-onnx",
+    "sherpa-onnx-core",
+    "sherpa-onnx-bin",
+]
+
+[[tool.uv.index]]
+name = "sherpa-onnx-cpu"
+url = "https://k2-fsa.github.io/sherpa/onnx/cpu.html"
+format = "flat"

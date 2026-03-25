@@ -1,0 +1,23 @@
+[Unit]
+Description=PinePhone Voice Agent — TTS daemon (sherpa-onnx VITS)
+After=default.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/pp_voice_agent/.venv/bin/python3 %h/pp_voice_agent/tts-server.py
+
+Environment=MODEL_DIR=%h/sherpa-onnx-v1.12.33-linux-aarch64-shared-cpu/vits-piper-en_US-amy-low
+Environment=NUM_THREADS=2
+
+Restart=on-failure
+RestartSec=3
+
+MemoryHigh=128M
+MemoryMax=256M
+AllowedCPUs=0-3
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
