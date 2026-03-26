@@ -7,11 +7,16 @@ Flow:
   2. On wake: enter conversation mode
   3. Conversation mode loop:
      a. Record with VAD + ASR + Smart Turn
-     b. Send to LLM, stream response to TTS
-     c. Wait for TTS to finish (sync)
-     d. Listen again immediately (no wake word needed)
-     e. If no speech for CONVO_TIMEOUT_S, exit to wake mode
+     b. Send to LLM (lightweight tool prompt)
+     c. If LLM responds with ACTION: → execute tool, speak template
+     d. If LLM responds with text → stream to TTS as phrases
+     e. Wait for TTS to finish, listen again
+     f. If no speech for CONVO_TIMEOUT_S, exit to wake mode
   4. Back to step 1
+
+Tool calling uses lightweight ACTION: keyword detection instead of
+OpenAI function calling, cutting prompt from ~360 to ~70 tokens
+(8s vs 52s on RK3399S A72 cores).
 
 Target: RK3399S aarch64, 4GB RAM.
 """
@@ -22,6 +27,7 @@ import os
 import re
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -47,19 +53,119 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.5-0.8b")
 
 SAMPLE_RATE = 16000
 
-# VAD parameters
 VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.5"))
 SILENCE_TIMEOUT_S = float(os.environ.get("SILENCE_TIMEOUT", "0.6"))
 MAX_RECORD_S = float(os.environ.get("MAX_RECORD_S", "30"))
 
-# Smart Turn
 SMART_TURN_THRESHOLD = float(os.environ.get("SMART_TURN_THRESHOLD", "0.5"))
 
-# TTS chunking
-TTS_WORD_FLUSH = int(os.environ.get("TTS_WORD_FLUSH", "3"))
+TTS_WORD_FLUSH = int(os.environ.get("TTS_WORD_FLUSH", "5"))
 
-# Conversation mode timeout
 CONVO_TIMEOUT_S = float(os.environ.get("CONVO_TIMEOUT", "4.0"))
+
+
+# ─── Tool definitions ────────────────────────────────────────────────
+
+TOOLS = {
+    "toggle_flashlight": {
+        "command": ["sxmo_flashtoggle.sh"],
+        "response": "I've toggled the flashlight.",
+    },
+    "set_brightness": {
+        "command": None,  # built dynamically
+        "response": "I've set the brightness to {level} percent.",
+    },
+    "toggle_wifi": {
+        "command": ["doas", "sxmo_wifitoggle.sh"],
+        "response": "I've toggled the WiFi.",
+    },
+    "send_sms": {
+        "command": None,  # built dynamically
+        "response": "I've sent the message.",
+    },
+    "make_call": {
+        "command": None,  # built dynamically
+        "response": "I'm calling {number}.",
+    },
+}
+
+# System prompt with tool descriptions — kept short for fast prompts
+SYSTEM_PROMPT = (
+    "/no_think You are a voice assistant on a PinePhone. "
+    "You can perform actions by responding ONLY with ACTION: followed by "
+    "the action. Available actions:\n"
+    "ACTION: toggle_flashlight\n"
+    "ACTION: set_brightness:LEVEL (0-100)\n"
+    "ACTION: toggle_wifi\n"
+    "ACTION: send_sms:NUMBER:MESSAGE\n"
+    "ACTION: make_call:NUMBER\n"
+    "For normal conversation, respond normally. "
+    "Keep responses concise — 1-3 sentences. "
+    "No markdown, no lists, no special characters."
+)
+
+# Pattern to detect ACTION: in LLM output
+_ACTION_RE = re.compile(
+    r'ACTION:\s*(\w+)(?::(.+))?', re.IGNORECASE)
+
+
+def execute_tool(action_str):
+    """Parse and execute an ACTION: string.
+
+    Format: ACTION: name or ACTION: name:arg1:arg2
+    Returns (success, tts_response).
+    """
+    m = _ACTION_RE.match(action_str.strip())
+    if not m:
+        return False, None
+
+    name = m.group(1).lower().strip()
+    args_str = m.group(2) or ""
+
+    tool = TOOLS.get(name)
+    if not tool:
+        return False, f"I don't know how to do {name}."
+
+    print(f"pipeline: executing {name} (args: {args_str})", file=sys.stderr)
+
+    try:
+        if name == "toggle_flashlight":
+            cmd = tool["command"]
+        elif name == "set_brightness":
+            level = args_str.strip() or "50"
+            cmd = ["brightnessctl", "-q", "set", f"{level}%"]
+            tool["response"] = f"I've set the brightness to {level} percent."
+        elif name == "toggle_wifi":
+            cmd = tool["command"]
+        elif name == "send_sms":
+            parts = args_str.split(":", 1)
+            number = parts[0].strip() if parts else ""
+            message = parts[1].strip() if len(parts) > 1 else ""
+            if not number:
+                return False, "I need a phone number to send a message."
+            cmd = ["sxmo_modemsendsms.sh", number, message]
+        elif name == "make_call":
+            number = args_str.strip()
+            if not number:
+                return False, "I need a phone number to make a call."
+            cmd = ["sxmo_modemdial.sh", number]
+            tool["response"] = f"I'm calling {number}."
+        else:
+            return False, f"I don't know how to do {name}."
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            return True, tool["response"]
+        else:
+            err = result.stderr.strip() or f"exit code {result.returncode}"
+            print(f"pipeline: tool error: {err}", file=sys.stderr)
+            return False, f"Sorry, {name} failed."
+
+    except subprocess.TimeoutExpired:
+        return False, f"Sorry, {name} timed out."
+    except Exception as e:
+        print(f"pipeline: tool exception: {e}", file=sys.stderr)
+        return False, "Sorry, something went wrong."
 
 
 # ─── Component loaders ───────────────────────────────────────────────
@@ -132,14 +238,12 @@ def load_smart_turn():
 
 
 def smart_turn_predict(sess, fe, audio_samples):
-    """Returns probability that the turn is complete."""
     target = 8 * SAMPLE_RATE
     if len(audio_samples) > target:
         audio_samples = audio_samples[-target:]
     elif len(audio_samples) < target:
         audio_samples = np.concatenate([
             np.zeros(target - len(audio_samples)), audio_samples])
-
     inputs = fe(audio_samples, sampling_rate=SAMPLE_RATE,
                 return_tensors="np", padding="max_length",
                 max_length=target, truncation=True, do_normalize=True)
@@ -152,7 +256,6 @@ def smart_turn_predict(sess, fe, audio_samples):
 # ─── TTS client ──────────────────────────────────────────────────────
 
 def tts_speak(text):
-    """Send text to TTS daemon. Non-blocking (daemon queues it)."""
     text = text.strip()
     if not text:
         return
@@ -171,7 +274,6 @@ def tts_speak(text):
 
 
 def tts_sync():
-    """Block until TTS daemon has finished playing all queued audio."""
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(120.0)
@@ -183,7 +285,7 @@ def tts_sync():
         print(f"pipeline: TTS sync error: {e}", file=sys.stderr)
 
 
-# ─── LLM streaming with phrase-level TTS ─────────────────────────────
+# ─── LLM streaming with ACTION: detection ────────────────────────────
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 _THINK_TAG_RE = re.compile(r"</?think>")
@@ -191,16 +293,18 @@ _PHRASE_BREAK = re.compile(r'([.!?,;:—\-])\s')
 
 
 def stream_llm(user_text, on_chunk):
-    """Stream LLM response, call on_chunk(str) for each phrase."""
+    """Stream LLM response. Detects ACTION: lines for tool execution.
+
+    Returns:
+        None if regular text response (already streamed to on_chunk).
+        String like "toggle_flashlight" or "set_brightness:75" if action.
+    """
     import urllib.request
 
     payload = json.dumps({
         "model": LLM_MODEL,
         "messages": [
-            {"role": "system", "content":
-             "/no_think You are a helpful voice assistant on a PinePhone. "
-             "Keep responses concise — 1-3 sentences. "
-             "No markdown, no lists, no special characters."},
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_text},
         ],
         "stream": True,
@@ -212,6 +316,7 @@ def stream_llm(user_text, on_chunk):
         data=payload,
         headers={"Content-Type": "application/json"})
 
+    full_response = ""
     buffer = ""
 
     def try_flush():
@@ -234,7 +339,7 @@ def stream_llm(user_text, on_chunk):
         return False
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             for line in resp:
                 line = line.decode("utf-8").strip()
                 if not line.startswith("data: "):
@@ -247,38 +352,56 @@ def stream_llm(user_text, on_chunk):
                     delta = chunk["choices"][0]["delta"]
                     token = delta.get("content", "")
                     if token:
+                        full_response += token
                         buffer += token
                         buffer = _THINK_RE.sub("", buffer)
                         buffer = _THINK_TAG_RE.sub("", buffer)
+
+                        # Check if this is an ACTION response
+                        # Don't stream to TTS yet — accumulate first
+                        # to detect ACTION: pattern
+                        clean = full_response.strip()
+                        clean = _THINK_RE.sub("", clean)
+                        clean = _THINK_TAG_RE.sub("", clean)
+
+                        if clean.upper().startswith("ACTION"):
+                            # Keep accumulating, don't flush to TTS
+                            continue
+
+                        # Regular text — flush phrases to TTS
                         while try_flush():
                             pass
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
 
+        # Final check: is the full response an ACTION?
+        clean = full_response.strip()
+        clean = _THINK_RE.sub("", clean)
+        clean = _THINK_TAG_RE.sub("", clean).strip()
+
+        if _ACTION_RE.match(clean):
+            return clean
+
+        # Regular text — flush remainder
         remaining = buffer.strip()
         if remaining:
             on_chunk(remaining)
+        return None
 
     except Exception as e:
         print(f"pipeline: LLM error: {e}", file=sys.stderr)
+        return None
 
 
 # ─── Recording + VAD + ASR + Smart Turn ─────────────────────────────
 
 def record_and_transcribe(asr, vad, smart_turn_sess, smart_turn_fe,
                           initial_timeout=None):
-    """Record from mic with queue-based architecture.
-
-    Args:
-        initial_timeout: If set, return None if no speech detected
-                         within this many seconds (for conversation mode).
-    """
     import sounddevice as sd
 
     asr_stream = asr.create_stream()
     vad.reset()
 
-    # Prime ASR with silence so first word isn't clipped
     asr_stream.accept_waveform(SAMPLE_RATE, [0.0] * 8000)
     while asr.is_ready(asr_stream):
         asr.decode_stream(asr_stream)
@@ -368,7 +491,6 @@ def record_and_transcribe(asr, vad, smart_turn_sess, smart_turn_fe,
 
             time.sleep(0.01)
 
-        # Final drain
         with q_lock:
             while audio_q:
                 chunk = audio_q.popleft()
@@ -394,6 +516,27 @@ def get_audio_device():
     return device
 
 
+def handle_llm_response(text):
+    """Send text to LLM, handle ACTION: or stream text to TTS."""
+    print("pipeline: LLM streaming...", file=sys.stderr)
+
+    action = stream_llm(text, lambda s: (
+        print(f"pipeline: TTS ← \"{s}\"", file=sys.stderr),
+        tts_speak(s),
+    ))
+
+    if action:
+        print(f"pipeline: action → {action}", file=sys.stderr)
+        success, response = execute_tool(action)
+        if response:
+            print(f"pipeline: TTS ← \"{response}\"", file=sys.stderr)
+            tts_speak(response)
+
+    print("pipeline: waiting for TTS...", file=sys.stderr)
+    tts_sync()
+    print("pipeline: response complete", file=sys.stderr)
+
+
 def main():
     import sounddevice as sd
 
@@ -416,9 +559,9 @@ def main():
     kws_blocksize = SAMPLE_RATE // 10
 
     print("pipeline: ready — say your wake word!", file=sys.stderr)
+    print(f"pipeline: tools: {', '.join(TOOLS.keys())}", file=sys.stderr)
 
     while running:
-        # ── Wake word phase ──
         kws_stream = kws.create_stream()
         wake_detected = False
 
@@ -453,7 +596,6 @@ def main():
 
         time.sleep(0.1)
 
-        # ── Conversation mode ──
         is_first_turn = True
 
         while running:
@@ -470,21 +612,11 @@ def main():
                     initial_timeout=CONVO_TIMEOUT_S)
 
             if text is None:
-                # Timeout — no speech, exit conversation mode
                 break
 
             if text:
                 print(f"pipeline: ASR → \"{text}\"", file=sys.stderr)
-                print("pipeline: LLM streaming...", file=sys.stderr)
-                stream_llm(text, lambda s: (
-                    print(f"pipeline: TTS ← \"{s}\"", file=sys.stderr),
-                    tts_speak(s),
-                ))
-
-                # Wait for TTS to finish playing before listening again
-                print("pipeline: waiting for TTS...", file=sys.stderr)
-                tts_sync()
-                print("pipeline: response complete", file=sys.stderr)
+                handle_llm_response(text)
             else:
                 print("pipeline: no speech detected", file=sys.stderr)
 
