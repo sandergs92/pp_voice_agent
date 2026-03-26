@@ -4,19 +4,14 @@ pipeline.py — Voice assistant pipeline for PinePhone Pro.
 
 Flow:
   1. Wake word detection (KWS) — always listening
-  2. On wake: enter conversation mode
+  2. On wake: say "Listening.", enter conversation mode
   3. Conversation mode loop:
      a. Record with VAD + ASR + Smart Turn
-     b. Send to LLM (lightweight tool prompt)
-     c. If LLM responds with ACTION: → execute tool, speak template
-     d. If LLM responds with text → stream to TTS as phrases
-     e. Wait for TTS to finish, listen again
-     f. If no speech for CONVO_TIMEOUT_S, exit to wake mode
+     b. If LLM responds with ACTION: → execute tool, speak template
+     c. If LLM responds with text → stream to TTS as phrases
+     d. Wait for TTS to finish, listen again
+     e. If no speech for CONVO_TIMEOUT_S, exit to wake mode
   4. Back to step 1
-
-Tool calling uses lightweight ACTION: keyword detection instead of
-OpenAI function calling, cutting prompt from ~360 to ~70 tokens
-(8s vs 52s on RK3399S A72 cores).
 
 Target: RK3399S aarch64, 4GB RAM.
 """
@@ -40,7 +35,7 @@ MODELS_DIR = os.environ.get("MODELS_DIR", os.path.expanduser("~/models"))
 KWS_MODEL_DIR = os.path.join(MODELS_DIR,
     "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01")
 ASR_MODEL_DIR = os.path.join(MODELS_DIR,
-    "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17")
+    "sherpa-onnx-streaming-zipformer-en-2023-06-26")
 SMART_TURN_MODEL = os.path.join(MODELS_DIR, "smart-turn-v3.2-cpu.onnx")
 SILERO_VAD_MODEL = os.path.join(MODELS_DIR, "silero_vad.onnx")
 
@@ -63,6 +58,10 @@ TTS_WORD_FLUSH = int(os.environ.get("TTS_WORD_FLUSH", "5"))
 
 CONVO_TIMEOUT_S = float(os.environ.get("CONVO_TIMEOUT", "4.0"))
 
+PRE_SPEECH_BUFFER_S = float(os.environ.get("PRE_SPEECH_BUFFER", "0.5"))
+
+DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
+
 
 # ─── Tool definitions ────────────────────────────────────────────────
 
@@ -71,50 +70,23 @@ TOOLS = {
         "command": ["sxmo_flashtoggle.sh"],
         "response": "I've toggled the flashlight.",
     },
-    "set_brightness": {
-        "command": None,  # built dynamically
-        "response": "I've set the brightness to {level} percent.",
-    },
-    "toggle_wifi": {
-        "command": ["doas", "sxmo_wifitoggle.sh"],
-        "response": "I've toggled the WiFi.",
-    },
-    "send_sms": {
-        "command": None,  # built dynamically
-        "response": "I've sent the message.",
-    },
-    "make_call": {
-        "command": None,  # built dynamically
-        "response": "I'm calling {number}.",
-    },
 }
 
-# System prompt with tool descriptions — kept short for fast prompts
 SYSTEM_PROMPT = (
-    "/no_think You are a voice assistant on a PinePhone. "
-    "You can perform actions by responding ONLY with ACTION: followed by "
-    "the action. Available actions:\n"
+    "/no_think You are a helpful voice assistant on a PinePhone. "
+    "For normal conversation, just respond naturally and concisely. "
+    "Only use ACTION when the user explicitly asks to control the phone. "
+    "Available actions (use ONLY when asked):\n"
     "ACTION: toggle_flashlight\n"
-    "ACTION: set_brightness:LEVEL (0-100)\n"
-    "ACTION: toggle_wifi\n"
-    "ACTION: send_sms:NUMBER:MESSAGE\n"
-    "ACTION: make_call:NUMBER\n"
-    "For normal conversation, respond normally. "
-    "Keep responses concise — 1-3 sentences. "
-    "No markdown, no lists, no special characters."
+    "Respond with exactly one ACTION line and nothing else when acting. "
+    "Keep responses to 1-2 sentences. No markdown or special characters."
 )
 
-# Pattern to detect ACTION: in LLM output
 _ACTION_RE = re.compile(
     r'ACTION:\s*(\w+)(?::(.+))?', re.IGNORECASE)
 
 
 def execute_tool(action_str):
-    """Parse and execute an ACTION: string.
-
-    Format: ACTION: name or ACTION: name:arg1:arg2
-    Returns (success, tts_response).
-    """
     m = _ACTION_RE.match(action_str.strip())
     if not m:
         return False, None
@@ -126,33 +98,10 @@ def execute_tool(action_str):
     if not tool:
         return False, f"I don't know how to do {name}."
 
-    print(f"pipeline: executing {name} (args: {args_str})", file=sys.stderr)
+    print(f"pipeline: executing {name}", file=sys.stderr)
 
     try:
-        if name == "toggle_flashlight":
-            cmd = tool["command"]
-        elif name == "set_brightness":
-            level = args_str.strip() or "50"
-            cmd = ["brightnessctl", "-q", "set", f"{level}%"]
-            tool["response"] = f"I've set the brightness to {level} percent."
-        elif name == "toggle_wifi":
-            cmd = tool["command"]
-        elif name == "send_sms":
-            parts = args_str.split(":", 1)
-            number = parts[0].strip() if parts else ""
-            message = parts[1].strip() if len(parts) > 1 else ""
-            if not number:
-                return False, "I need a phone number to send a message."
-            cmd = ["sxmo_modemsendsms.sh", number, message]
-        elif name == "make_call":
-            number = args_str.strip()
-            if not number:
-                return False, "I need a phone number to make a call."
-            cmd = ["sxmo_modemdial.sh", number]
-            tool["response"] = f"I'm calling {number}."
-        else:
-            return False, f"I don't know how to do {name}."
-
+        cmd = tool["command"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             return True, tool["response"]
@@ -193,11 +142,11 @@ def load_asr():
     import sherpa_onnx
     recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
         encoder=os.path.join(ASR_MODEL_DIR,
-            "encoder-epoch-99-avg-1.onnx"),
+            "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx"),
         decoder=os.path.join(ASR_MODEL_DIR,
-            "decoder-epoch-99-avg-1.onnx"),
+            "decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx"),
         joiner=os.path.join(ASR_MODEL_DIR,
-            "joiner-epoch-99-avg-1.onnx"),
+            "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx"),
         tokens=os.path.join(ASR_MODEL_DIR, "tokens.txt"),
         num_threads=2,
         provider="cpu",
@@ -293,12 +242,6 @@ _PHRASE_BREAK = re.compile(r'([.!?,;:—\-])\s')
 
 
 def stream_llm(user_text, on_chunk):
-    """Stream LLM response. Detects ACTION: lines for tool execution.
-
-    Returns:
-        None if regular text response (already streamed to on_chunk).
-        String like "toggle_flashlight" or "set_brightness:75" if action.
-    """
     import urllib.request
 
     payload = json.dumps({
@@ -357,24 +300,18 @@ def stream_llm(user_text, on_chunk):
                         buffer = _THINK_RE.sub("", buffer)
                         buffer = _THINK_TAG_RE.sub("", buffer)
 
-                        # Check if this is an ACTION response
-                        # Don't stream to TTS yet — accumulate first
-                        # to detect ACTION: pattern
                         clean = full_response.strip()
                         clean = _THINK_RE.sub("", clean)
                         clean = _THINK_TAG_RE.sub("", clean)
 
                         if clean.upper().startswith("ACTION"):
-                            # Keep accumulating, don't flush to TTS
                             continue
 
-                        # Regular text — flush phrases to TTS
                         while try_flush():
                             pass
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
 
-        # Final check: is the full response an ACTION?
         clean = full_response.strip()
         clean = _THINK_RE.sub("", clean)
         clean = _THINK_TAG_RE.sub("", clean).strip()
@@ -382,7 +319,6 @@ def stream_llm(user_text, on_chunk):
         if _ACTION_RE.match(clean):
             return clean
 
-        # Regular text — flush remainder
         remaining = buffer.strip()
         if remaining:
             on_chunk(remaining)
@@ -402,17 +338,18 @@ def record_and_transcribe(asr, vad, smart_turn_sess, smart_turn_fe,
     asr_stream = asr.create_stream()
     vad.reset()
 
-    asr_stream.accept_waveform(SAMPLE_RATE, [0.0] * 8000)
-    while asr.is_ready(asr_stream):
-        asr.decode_stream(asr_stream)
-
     window_size = vad.window_size()
+
+    pre_speech_max = int(PRE_SPEECH_BUFFER_S * SAMPLE_RATE)
+    pre_speech_buf = collections.deque()
+    pre_speech_len = 0
 
     audio_q = collections.deque()
     q_lock = threading.Lock()
     done = threading.Event()
 
     all_samples = []
+    asr_samples = []
     speech_started = False
     silence_start = None
     listen_start = time.monotonic()
@@ -425,6 +362,8 @@ def record_and_transcribe(asr, vad, smart_turn_sess, smart_turn_fe,
 
     device = get_audio_device()
     max_samples = int(MAX_RECORD_S * SAMPLE_RATE)
+
+    print("pipeline: listening...", file=sys.stderr)
 
     with sd.InputStream(
         device=device,
@@ -442,23 +381,48 @@ def record_and_transcribe(asr, vad, smart_turn_sess, smart_turn_fe,
 
             for chunk in chunks:
                 samples = chunk
-                all_samples.extend(samples.tolist())
-                asr_stream.accept_waveform(SAMPLE_RATE, samples.tolist())
+                samples_list = samples.tolist()
+                all_samples.extend(samples_list)
 
                 for j in range(0, len(samples), window_size):
                     sub = samples[j:j + window_size]
                     if len(sub) < window_size:
                         break
                     is_speech = vad.is_speech(sub.tolist())
-                    if is_speech:
-                        if not speech_started:
-                            print("pipeline: speech detected",
-                                  file=sys.stderr)
+
+                    if is_speech and not speech_started:
                         speech_started = True
+                        print("pipeline: speech detected", file=sys.stderr)
+
+                        while pre_speech_buf:
+                            old = pre_speech_buf.popleft()
+                            asr_stream.accept_waveform(SAMPLE_RATE, old)
+                            if DEBUG:
+                                asr_samples.extend(old)
+                        pre_speech_len = 0
+
+                        asr_stream.accept_waveform(SAMPLE_RATE, samples_list)
+                        if DEBUG:
+                            asr_samples.extend(samples_list)
+                        break
+
+                    elif is_speech:
                         silence_start = None
                     elif speech_started:
                         if silence_start is None:
                             silence_start = time.monotonic()
+                else:
+                    if speech_started:
+                        asr_stream.accept_waveform(SAMPLE_RATE, samples_list)
+                        if DEBUG:
+                            asr_samples.extend(samples_list)
+                    else:
+                        pre_speech_buf.append(samples_list)
+                        pre_speech_len += len(samples_list)
+                        while (pre_speech_len > pre_speech_max
+                               and pre_speech_buf):
+                            removed = pre_speech_buf.popleft()
+                            pre_speech_len -= len(removed)
 
             while asr.is_ready(asr_stream):
                 asr.decode_stream(asr_stream)
@@ -494,7 +458,10 @@ def record_and_transcribe(asr, vad, smart_turn_sess, smart_turn_fe,
         with q_lock:
             while audio_q:
                 chunk = audio_q.popleft()
-                asr_stream.accept_waveform(SAMPLE_RATE, chunk.tolist())
+                chunk_list = chunk.tolist()
+                asr_stream.accept_waveform(SAMPLE_RATE, chunk_list)
+                if DEBUG:
+                    asr_samples.extend(chunk_list)
         while asr.is_ready(asr_stream):
             asr.decode_stream(asr_stream)
 
@@ -503,8 +470,25 @@ def record_and_transcribe(asr, vad, smart_turn_sess, smart_turn_fe,
     if not speech_started:
         return None
 
-    result_text = asr.get_result(asr_stream).strip()
-    return result_text
+    if DEBUG:
+        import wave as _wave
+        import array as _array
+        _dbg_path = "/tmp/pipeline_asr_input.wav"
+        _int = _array.array("h",
+            (int(max(-1.0, min(1.0, s)) * 32767) for s in asr_samples))
+        with _wave.open(_dbg_path, "wb") as _wf:
+            _wf.setnchannels(1)
+            _wf.setsampwidth(2)
+            _wf.setframerate(SAMPLE_RATE)
+            _wf.writeframes(_int.tobytes())
+        print(f"pipeline: DEBUG saved {len(asr_samples)/SAMPLE_RATE:.1f}s "
+              f"to {_dbg_path}", file=sys.stderr)
+
+    asr_stream.input_finished()
+    while asr.is_ready(asr_stream):
+        asr.decode_stream(asr_stream)
+
+    return asr.get_result(asr_stream).strip()
 
 
 # ─── Main loop ───────────────────────────────────────────────────────
@@ -517,7 +501,6 @@ def get_audio_device():
 
 
 def handle_llm_response(text):
-    """Send text to LLM, handle ACTION: or stream text to TTS."""
     print("pipeline: LLM streaming...", file=sys.stderr)
 
     action = stream_llm(text, lambda s: (
@@ -559,7 +542,8 @@ def main():
     kws_blocksize = SAMPLE_RATE // 10
 
     print("pipeline: ready — say your wake word!", file=sys.stderr)
-    print(f"pipeline: tools: {', '.join(TOOLS.keys())}", file=sys.stderr)
+    if DEBUG:
+        print("pipeline: DEBUG mode enabled", file=sys.stderr)
 
     while running:
         kws_stream = kws.create_stream()
@@ -594,19 +578,21 @@ def main():
         if not wake_detected:
             continue
 
-        time.sleep(0.1)
+        # Wake mic closed — TTS feedback then record
+        time.sleep(0.3)
+        tts_speak("Listening.")
+        tts_sync()
+        time.sleep(0.15)
 
+        # ── Conversation mode ──
         is_first_turn = True
 
         while running:
             if is_first_turn:
-                print("pipeline: listening...", file=sys.stderr)
                 text = record_and_transcribe(
                     asr, vad, smart_turn_sess, smart_turn_fe,
                     initial_timeout=None)
             else:
-                print("pipeline: listening for follow-up...",
-                      file=sys.stderr)
                 text = record_and_transcribe(
                     asr, vad, smart_turn_sess, smart_turn_fe,
                     initial_timeout=CONVO_TIMEOUT_S)
