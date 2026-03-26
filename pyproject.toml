@@ -8,6 +8,13 @@ dependencies = [
     "sherpa-onnx",
     "sherpa-onnx-core",
     "sherpa-onnx-bin",
+    "sounddevice>=0.5.5",
+    "click>=8.3.1",
+    "sentencepiece>=0.2.1",
+    "pypinyin>=0.55.0",
+    "numpy>=2.4.3",
+    "onnxruntime>=1.24.4",
+    "transformers>=5.3.0",
 ]
 
 [[tool.uv.index]]

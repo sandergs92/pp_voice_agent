@@ -8,7 +8,7 @@ StartLimitBurst=5
 Type=simple
 ExecStart=%h/pp_voice_agent/.venv/bin/python3 %h/pp_voice_agent/tts-server.py
 
-Environment=MODEL_DIR=%h/sherpa-onnx-v1.12.33-linux-aarch64-shared-cpu/vits-piper-en_US-amy-low
+Environment=MODEL_DIR=%h/models/vits-piper-en_US-amy-low
 Environment=NUM_THREADS=2
 
 Restart=on-failure
