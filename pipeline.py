@@ -40,7 +40,7 @@ SMART_TURN_MODEL = os.path.join(MODELS_DIR, "smart-turn-v3.2-cpu.onnx")
 SILERO_VAD_MODEL = os.path.join(MODELS_DIR, "silero_vad.onnx")
 
 KEYWORDS_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "keywords.txt")
+    os.path.dirname(os.path.abspath(__file__)), "kws", "keywords.txt")
 TTS_SOCKET = os.environ.get("TTS_SOCKET",
     os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "pp-tts.sock"))
 LLM_URL = os.environ.get("LLM_URL", "http://localhost:8080/v1/chat/completions")

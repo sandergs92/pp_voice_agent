@@ -13,8 +13,8 @@ pactl set-card-profile alsa_card.platform-rt5640-sound "HiFi (Mic, Speaker)" 2>/
 # ── 2) Restore known-good ALSA state ──
 # This sets all 139 mixer controls atomically — more reliable than
 # individual amixer commands which can fail silently on wrong profile.
-if [ -f ~/pp_voice_agent/asound.state.working ]; then
-    sudo cp ~/pp_voice_agent/asound.state.working /var/lib/alsa/asound.state
+if [ -f ~/pp_voice_agent/audio/asound.state.working ]; then
+    sudo cp ~/pp_voice_agent/audio/asound.state.working /var/lib/alsa/asound.state
     sudo alsactl restore
     echo "ALSA state restored from asound.state.working"
 else

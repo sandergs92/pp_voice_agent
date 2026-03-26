@@ -8,5 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
-denoise_source
-denoise_stream
+
+# Compiled binaries
+denoise/denoise_source
+denoise/denoise_stream

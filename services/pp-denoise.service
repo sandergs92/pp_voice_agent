@@ -6,7 +6,7 @@ Requires=pipewire.service
 [Service]
 Type=simple
 ExecStartPre=/bin/sleep 3
-ExecStart=%h/pp_voice_agent/denoise_source %h/models/gtcrn_simple.onnx
+ExecStart=%h/pp_voice_agent/denoise/denoise_source %h/models/gtcrn_simple.onnx
 Restart=on-failure
 RestartSec=3
 AllowedCPUs=0-3
