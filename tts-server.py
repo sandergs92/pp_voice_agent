@@ -117,9 +117,9 @@ def play_wav(wav_path):
     """Play a WAV file via the best available audio backend."""
     try:
         for cmd in (
-            ["aplay", "-q", wav_path],
             ["pw-play", wav_path],
             ["paplay", wav_path],
+            ["aplay", "-q", wav_path],
         ):
             try:
                 subprocess.run(cmd, check=True, timeout=30,
