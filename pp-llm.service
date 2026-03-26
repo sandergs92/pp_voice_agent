@@ -12,10 +12,8 @@ ExecStart=%h/llama.cpp/build/bin/llama-server \
     -t 4 --ctx-size 512 --reasoning-budget 0 \
     --flash-attn on --mlock --prio 2 \
     --log-disable
-
 Restart=on-failure
 RestartSec=3
-
 AllowedCPUs=4-5
 NoNewPrivileges=yes
 

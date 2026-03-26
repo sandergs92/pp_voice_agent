@@ -1,0 +1,12 @@
+[Unit]
+Description=Set Clean Mic as default source
+After=pp-denoise.service
+Requires=pp-denoise.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'sleep 2; for i in 1 2 3 4 5; do ID=$(wpctl status 2>/dev/null | grep "Clean Mic" | sed "s/[^0-9]*\\([0-9]*\\).*/\\1/") && [ -n "$ID" ] && wpctl set-default "$ID" && echo "Set clean_mic default (id=$ID)" && exit 0; sleep 1; done; echo "Failed to find clean_mic"; exit 1'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target

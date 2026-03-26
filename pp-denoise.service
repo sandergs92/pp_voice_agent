@@ -1,0 +1,17 @@
+[Unit]
+Description=System-wide Mic Denoiser (gtcrn via ALSA+PipeWire)
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 3
+ExecStart=%h/pp_voice_agent/denoise_source %h/models/gtcrn_simple.onnx
+Restart=on-failure
+RestartSec=3
+AllowedCPUs=0-3
+MemoryHigh=64M
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

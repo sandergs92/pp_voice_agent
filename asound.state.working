@@ -141,8 +141,8 @@ state.PinePhonePro {
 	control.12 {
 		iface MIXER
 		name 'DAC1 Playback Volume'
-		value.0 172
-		value.1 172
+		value.0 175
+		value.1 175
 		comment {
 			access 'read write'
 			type INTEGER
@@ -150,8 +150,8 @@ state.PinePhonePro {
 			range '0 - 175'
 			dbmin -6562
 			dbmax 0
-			dbvalue.0 -113
-			dbvalue.1 -113
+			dbvalue.0 0
+			dbvalue.1 0
 		}
 	}
 	control.13 {
@@ -1073,7 +1073,7 @@ state.PinePhonePro {
 	control.92 {
 		iface MIXER
 		name 'SPK MIXR OUT MIXR Switch'
-		value true
+		value false
 		comment {
 			access 'read write'
 			type BOOLEAN
@@ -1163,7 +1163,7 @@ state.PinePhonePro {
 	control.101 {
 		iface MIXER
 		name 'LOUT MIX DAC L1 Switch'
-		value true
+		value false
 		comment {
 			access 'read write'
 			type BOOLEAN
@@ -1203,7 +1203,7 @@ state.PinePhonePro {
 	control.105 {
 		iface MIXER
 		name 'Speaker L Playback Switch'
-		value false
+		value true
 		comment {
 			access 'read write'
 			type BOOLEAN
@@ -1213,7 +1213,7 @@ state.PinePhonePro {
 	control.106 {
 		iface MIXER
 		name 'Speaker R Playback Switch'
-		value false
+		value true
 		comment {
 			access 'read write'
 			type BOOLEAN
@@ -1436,7 +1436,7 @@ state.PinePhonePro {
 	control.128 {
 		iface MIXER
 		name 'OUT MIXR REC MIXR Switch'
-		value true
+		value false
 		comment {
 			access 'read write'
 			type BOOLEAN
