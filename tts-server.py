@@ -8,23 +8,16 @@ then listens on a UNIX domain socket for text lines.
 Architecture — three-stage pipeline:
   accept loop → synth thread → playback thread
 
-The accept loop reads text from each connection and enqueues it.
-The synth thread generates audio (RTF ~0.72, faster than real-time).
-The playback thread writes WAV and plays via ALSA/PipeWire.
-
-This means the pipeline client can push sentence N+1 while sentence N
-is still playing, and synthesis of N+1 overlaps with playback of N.
-Bounded queue (depth 4) caps memory on a 4GB device.
-
-Target: RK3399S aarch64, 4GB RAM.
-CPU policy: 2 ONNX threads on A53 cluster, A72 free for LLM.
-
 Protocol (per connection):
   Client sends: <text>\n
   Server sends: OK\n  (accepted into queue)
                | FULL\n (queue at capacity, try again)
                | ERR <reason>\n
-  Server closes connection.
+
+  Special command:
+  Client sends: __SYNC__\n
+  Server blocks until both synth and playback queues are drained,
+  then sends: OK\n
 
 Socket: $XDG_RUNTIME_DIR/pp-tts.sock (or /tmp/pp-tts.sock)
 """
@@ -158,6 +151,13 @@ class TTSPipeline:
         self._audio_q_not_full = threading.Condition(self._audio_q_lock)
         self._audio_q = deque()
 
+        # Idle tracking: set when both queues are empty AND no
+        # synth/playback is in progress
+        self._synth_busy = False
+        self._play_busy = False
+        self._idle_event = threading.Event()
+        self._idle_event.set()  # starts idle
+
         self._synth_thread = threading.Thread(
             target=self._synth_loop, name="tts-synth", daemon=True)
         self._play_thread = threading.Thread(
@@ -171,8 +171,22 @@ class TTSPipeline:
             if len(self._text_q) >= QUEUE_DEPTH:
                 return False
             self._text_q.append(text)
+            self._idle_event.clear()
             self._text_q_not_empty.notify()
             return True
+
+    def wait_idle(self, timeout=60.0):
+        """Block until both queues are drained and nothing is playing."""
+        return self._idle_event.wait(timeout=timeout)
+
+    def _update_idle(self):
+        """Check if pipeline is fully idle and signal if so."""
+        with self._text_q_lock:
+            text_empty = len(self._text_q) == 0
+        with self._audio_q_lock:
+            audio_empty = len(self._audio_q) == 0
+        if text_empty and audio_empty and not self._synth_busy and not self._play_busy:
+            self._idle_event.set()
 
     def shutdown(self):
         self._running = False
@@ -198,6 +212,7 @@ class TTSPipeline:
             if text is _POISON:
                 break
 
+            self._synth_busy = True
             try:
                 t0 = time.monotonic()
                 audio = self.tts.generate(text, sid=SID, speed=SPEED)
@@ -220,6 +235,9 @@ class TTSPipeline:
 
             except Exception as e:
                 print(f"pp-tts: synth error: {e}", file=sys.stderr)
+            finally:
+                self._synth_busy = False
+                self._update_idle()
 
     def _play_loop(self):
         while self._running:
@@ -227,6 +245,7 @@ class TTSPipeline:
                 while not self._audio_q and self._running:
                     self._audio_q_not_empty.wait(timeout=1.0)
                 if not self._audio_q:
+                    self._update_idle()
                     continue
                 wav_path = self._audio_q.popleft()
                 self._audio_q_not_full.notify()
@@ -234,14 +253,21 @@ class TTSPipeline:
             if wav_path is _POISON:
                 break
 
+            self._play_busy = True
             try:
                 play_wav(wav_path)
             except Exception as e:
                 print(f"pp-tts: play error: {e}", file=sys.stderr)
+            finally:
+                self._play_busy = False
+                self._update_idle()
 
 
 def handle_connection(conn, pipeline):
-    """Read one text line, enqueue for synthesis, respond immediately."""
+    """Read one text line, enqueue for synthesis, respond immediately.
+
+    Special command __SYNC__: block until pipeline is fully idle.
+    """
     try:
         conn.settimeout(10.0)
         data = b""
@@ -254,6 +280,13 @@ def handle_connection(conn, pipeline):
         text = data.decode("utf-8", errors="replace").strip()
         if not text:
             conn.sendall(b"ERR empty\n")
+            return
+
+        # Handle sync command
+        if text == "__SYNC__":
+            conn.settimeout(120.0)
+            pipeline.wait_idle(timeout=60.0)
+            conn.sendall(b"OK\n")
             return
 
         text = text[:MAX_TEXT_LEN]

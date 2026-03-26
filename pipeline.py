@@ -4,16 +4,14 @@ pipeline.py — Voice assistant pipeline for PinePhone Pro.
 
 Flow:
   1. Wake word detection (KWS) — always listening
-  2. On wake: close wake mic, start recording with VAD + ASR
-  3. On silence: Smart Turn decides if user is done
-  4. If done: get final ASR text, send to LLM
-  5. Stream LLM response, buffer to phrases, send to TTS daemon
-  6. After TTS finishes, reopen wake mic
-
-Audio architecture:
-  - Only one InputStream open at a time (avoids ALSA/PipeWire conflicts)
-  - Audio callback only queues samples (fast, no blocking)
-  - Main thread feeds ASR + runs VAD + runs Smart Turn (thread-safe)
+  2. On wake: enter conversation mode
+  3. Conversation mode loop:
+     a. Record with VAD + ASR + Smart Turn
+     b. Send to LLM, stream response to TTS
+     c. Wait for TTS to finish (sync)
+     d. Listen again immediately (no wake word needed)
+     e. If no speech for CONVO_TIMEOUT_S, exit to wake mode
+  4. Back to step 1
 
 Target: RK3399S aarch64, 4GB RAM.
 """
@@ -57,8 +55,11 @@ MAX_RECORD_S = float(os.environ.get("MAX_RECORD_S", "30"))
 # Smart Turn
 SMART_TURN_THRESHOLD = float(os.environ.get("SMART_TURN_THRESHOLD", "0.5"))
 
-# TTS chunking: flush buffer when hitting punctuation or this many words
-TTS_WORD_FLUSH = int(os.environ.get("TTS_WORD_FLUSH", "5"))
+# TTS chunking
+TTS_WORD_FLUSH = int(os.environ.get("TTS_WORD_FLUSH", "3"))
+
+# Conversation mode timeout
+CONVO_TIMEOUT_S = float(os.environ.get("CONVO_TIMEOUT", "4.0"))
 
 
 # ─── Component loaders ───────────────────────────────────────────────
@@ -169,22 +170,28 @@ def tts_speak(text):
         print(f"pipeline: TTS error: {e}", file=sys.stderr)
 
 
+def tts_sync():
+    """Block until TTS daemon has finished playing all queued audio."""
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(120.0)
+        sock.connect(TTS_SOCKET)
+        sock.sendall(b"__SYNC__\n")
+        resp = sock.recv(64)
+        sock.close()
+    except Exception as e:
+        print(f"pipeline: TTS sync error: {e}", file=sys.stderr)
+
+
 # ─── LLM streaming with phrase-level TTS ─────────────────────────────
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 _THINK_TAG_RE = re.compile(r"</?think>")
-
-# Punctuation that marks a natural phrase boundary for TTS
 _PHRASE_BREAK = re.compile(r'([.!?,;:—\-])\s')
 
 
 def stream_llm(user_text, on_chunk):
-    """Stream LLM response, call on_chunk(str) for each phrase.
-
-    Splits on punctuation (.,!?;:—) or after TTS_WORD_FLUSH words,
-    whichever comes first. This gives TTS enough for natural prosody
-    while minimizing latency vs waiting for full sentences.
-    """
+    """Stream LLM response, call on_chunk(str) for each phrase."""
     import urllib.request
 
     payload = json.dumps({
@@ -208,10 +215,7 @@ def stream_llm(user_text, on_chunk):
     buffer = ""
 
     def try_flush():
-        """Flush buffer on phrase boundary or word count."""
         nonlocal buffer
-
-        # Try punctuation break first
         m = _PHRASE_BREAK.search(buffer)
         if m:
             end = m.end()
@@ -220,8 +224,6 @@ def stream_llm(user_text, on_chunk):
             if chunk:
                 on_chunk(chunk)
             return True
-
-        # Fallback: flush on word count
         words = buffer.split()
         if len(words) >= TTS_WORD_FLUSH:
             chunk = buffer.strip()
@@ -229,7 +231,6 @@ def stream_llm(user_text, on_chunk):
             if chunk:
                 on_chunk(chunk)
             return True
-
         return False
 
     try:
@@ -247,16 +248,13 @@ def stream_llm(user_text, on_chunk):
                     token = delta.get("content", "")
                     if token:
                         buffer += token
-                        # Strip think tags
                         buffer = _THINK_RE.sub("", buffer)
                         buffer = _THINK_TAG_RE.sub("", buffer)
-                        # Try to flush as often as possible
                         while try_flush():
                             pass
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
 
-        # Flush whatever remains
         remaining = buffer.strip()
         if remaining:
             on_chunk(remaining)
@@ -267,11 +265,13 @@ def stream_llm(user_text, on_chunk):
 
 # ─── Recording + VAD + ASR + Smart Turn ─────────────────────────────
 
-def record_and_transcribe(asr, vad, smart_turn_sess, smart_turn_fe):
+def record_and_transcribe(asr, vad, smart_turn_sess, smart_turn_fe,
+                          initial_timeout=None):
     """Record from mic with queue-based architecture.
 
-    Audio callback only appends to a deque (fast, never blocks).
-    Main thread pulls from deque, feeds VAD + ASR, runs Smart Turn.
+    Args:
+        initial_timeout: If set, return None if no speech detected
+                         within this many seconds (for conversation mode).
     """
     import sounddevice as sd
 
@@ -292,14 +292,13 @@ def record_and_transcribe(asr, vad, smart_turn_sess, smart_turn_fe):
     all_samples = []
     speech_started = False
     silence_start = None
+    listen_start = time.monotonic()
 
     def audio_callback(indata, frames, time_info, status):
         if done.is_set():
             return
         with q_lock:
             audio_q.append(indata[:, 0].copy())
-
-    print("pipeline: listening...", file=sys.stderr)
 
     device = get_audio_device()
     max_samples = int(MAX_RECORD_S * SAMPLE_RATE)
@@ -357,6 +356,13 @@ def record_and_transcribe(asr, vad, smart_turn_sess, smart_turn_fe):
                 else:
                     silence_start = None
 
+            if (initial_timeout is not None
+                    and not speech_started
+                    and time.monotonic() - listen_start >= initial_timeout):
+                print("pipeline: conversation timeout, "
+                      "returning to wake mode", file=sys.stderr)
+                done.set()
+
             if len(all_samples) >= max_samples:
                 done.set()
 
@@ -371,6 +377,10 @@ def record_and_transcribe(asr, vad, smart_turn_sess, smart_turn_fe):
             asr.decode_stream(asr_stream)
 
     time.sleep(0.15)
+
+    if not speech_started:
+        return None
+
     result_text = asr.get_result(asr_stream).strip()
     return result_text
 
@@ -408,6 +418,7 @@ def main():
     print("pipeline: ready — say your wake word!", file=sys.stderr)
 
     while running:
+        # ── Wake word phase ──
         kws_stream = kws.create_stream()
         wake_detected = False
 
@@ -442,19 +453,44 @@ def main():
 
         time.sleep(0.1)
 
-        text = record_and_transcribe(asr, vad, smart_turn_sess, smart_turn_fe)
+        # ── Conversation mode ──
+        is_first_turn = True
 
-        if text:
-            print(f"pipeline: ASR → \"{text}\"", file=sys.stderr)
-            print("pipeline: LLM streaming...", file=sys.stderr)
-            stream_llm(text, lambda s: (
-                print(f"pipeline: TTS ← \"{s}\"", file=sys.stderr),
-                tts_speak(s),
-            ))
-            print("pipeline: response complete", file=sys.stderr)
-            time.sleep(1.0)
-        else:
-            print("pipeline: no speech detected", file=sys.stderr)
+        while running:
+            if is_first_turn:
+                print("pipeline: listening...", file=sys.stderr)
+                text = record_and_transcribe(
+                    asr, vad, smart_turn_sess, smart_turn_fe,
+                    initial_timeout=None)
+            else:
+                print("pipeline: listening for follow-up...",
+                      file=sys.stderr)
+                text = record_and_transcribe(
+                    asr, vad, smart_turn_sess, smart_turn_fe,
+                    initial_timeout=CONVO_TIMEOUT_S)
+
+            if text is None:
+                # Timeout — no speech, exit conversation mode
+                break
+
+            if text:
+                print(f"pipeline: ASR → \"{text}\"", file=sys.stderr)
+                print("pipeline: LLM streaming...", file=sys.stderr)
+                stream_llm(text, lambda s: (
+                    print(f"pipeline: TTS ← \"{s}\"", file=sys.stderr),
+                    tts_speak(s),
+                ))
+
+                # Wait for TTS to finish playing before listening again
+                print("pipeline: waiting for TTS...", file=sys.stderr)
+                tts_sync()
+                print("pipeline: response complete", file=sys.stderr)
+            else:
+                print("pipeline: no speech detected", file=sys.stderr)
+
+            is_first_turn = False
+
+        print("pipeline: back to wake mode", file=sys.stderr)
 
     print("pipeline: shutdown", file=sys.stderr)
 
