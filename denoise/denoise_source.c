@@ -8,7 +8,7 @@
  * Build:  make -f Makefile
  * Run:    ./denoise_source ~/models/gtcrn_simple.onnx
  *
- * Copyright 2025, PinePhone Voice Agent project. MIT licence.
+ * Copyright 2026, PinePhone Voice Agent project. MIT licence.
  */
 
 #include <pipewire/pipewire.h>

@@ -8,7 +8,7 @@ StartLimitBurst=5
 Type=simple
 Environment=LD_LIBRARY_PATH=%h/llama.cpp/build/bin
 ExecStart=%h/llama.cpp/build/bin/llama-server \
-    -m %h/models/Qwen3.5-0.8B-Q4_K_M.gguf \
+    -m %h/models/gemma-3-270m-it-Q4_K_M.gguf \
     -t 4 --ctx-size 512 --reasoning-budget 0 \
     --flash-attn on --mlock --prio 2 \
     --log-disable

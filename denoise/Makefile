@@ -1,6 +1,6 @@
 # Makefile for PinePhone Pro audio denoiser tools
  
-SHERPA_PREFIX := $(HOME)/pp_voice_agent/.venv/lib/python3.14/site-packages/sherpa_onnx
+SHERPA_PREFIX := $(HOME)/pp_voice_agent/.venv/lib/python3.13/site-packages/sherpa_onnx
  
 CC      := gcc
 CFLAGS  := -O2 -Wall -Wextra \

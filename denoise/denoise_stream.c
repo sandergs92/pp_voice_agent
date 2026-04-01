@@ -11,7 +11,7 @@
  *
  * Build:  make -f Makefile
  *
- * Copyright 2025, PinePhone Voice Agent project. MIT licence.
+ * Copyright 2026, PinePhone Voice Agent project. MIT licence.
  */
 
 #include <sherpa-onnx/c-api/c-api.h>
